@@ -1,15 +1,31 @@
-
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
+
+const User = require("./models/User");
+const passport = require("./config/passport");
+const socialAuthRoutes = require("./routes/socialAuthRoutes");
 
 const app = express();
 
+// ==================== MIDDLEWARE ====================
 
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:5173"
+}));
+
 app.use(express.json());
 
+// Passport initialize
+app.use(passport.initialize());
+
+// Social login routes
+app.use("/auth", socialAuthRoutes);
+
+// ==================== TODO MODEL ====================
 
 const todoSchema = new mongoose.Schema(
   {
@@ -22,6 +38,12 @@ const todoSchema = new mongoose.Schema(
     completed: {
       type: Boolean,
       default: false
+    },
+
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true
     }
   },
   {
@@ -29,9 +51,35 @@ const todoSchema = new mongoose.Schema(
   }
 );
 
-
 const Todo = mongoose.model("Todo", todoSchema);
 
+// ==================== AUTH MIDDLEWARE ====================
+
+const authMiddleware = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        message: "Please login first"
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    req.userId = decoded.userId;
+
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      message: "Invalid or expired token"
+    });
+  }
+};
+
+// ==================== HOME ROUTE ====================
 
 app.get("/", (req, res) => {
   res.json({
@@ -39,8 +87,143 @@ app.get("/", (req, res) => {
   });
 });
 
+// ==================== SIGNUP API ====================
 
-app.post("/todos", async (req, res) => {
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        message: "Name, email and password are required"
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        message: "Password must be at least 6 characters"
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const existingUser = await User.findOne({
+      email: normalizedEmail
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        message: "Email already registered"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+      name: name.trim(),
+      email: normalizedEmail,
+      password: hashedPassword
+    });
+
+    res.status(201).json({
+      message: "Signup successful",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Signup failed",
+      error: error.message
+    });
+  }
+});
+
+// ==================== LOGIN API ====================
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        message: "Email and password are required"
+      });
+    }
+
+    const user = await User.findOne({
+      email: email.trim().toLowerCase()
+    });
+
+    if (!user) {
+      return res.status(401).json({
+        message: "Invalid email or password"
+      });
+    }
+
+    const isPasswordMatch = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!isPasswordMatch) {
+      return res.status(401).json({
+        message: "Invalid email or password"
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        userId: user._id
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "1d"
+      }
+    );
+
+    res.status(200).json({
+      message: "Login successful",
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Login failed",
+      error: error.message
+    });
+  }
+});
+
+// ==================== GET PROFILE ====================
+
+app.get("/auth/me", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("-password");
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found"
+      });
+    }
+
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({
+      message: "Unable to fetch profile"
+    });
+  }
+});
+
+// ==================== CREATE TODO ====================
+
+app.post("/todos", authMiddleware, async (req, res) => {
   try {
     const { title } = req.body;
 
@@ -51,14 +234,14 @@ app.post("/todos", async (req, res) => {
     }
 
     const todo = await Todo.create({
-      title: title.trim()
+      title: title.trim(),
+      userId: req.userId
     });
 
     res.status(201).json({
       message: "Todo Created Successfully",
       todo
     });
-
   } catch (error) {
     res.status(500).json({
       message: "Error Creating Todo",
@@ -67,15 +250,17 @@ app.post("/todos", async (req, res) => {
   }
 });
 
+// ==================== GET ALL TODOS ====================
 
-app.get("/todos", async (req, res) => {
+app.get("/todos", authMiddleware, async (req, res) => {
   try {
-    const todos = await Todo.find().sort({
+    const todos = await Todo.find({
+      userId: req.userId
+    }).sort({
       createdAt: -1
     });
 
     res.status(200).json(todos);
-
   } catch (error) {
     res.status(500).json({
       message: "Error Fetching Todos",
@@ -84,10 +269,14 @@ app.get("/todos", async (req, res) => {
   }
 });
 
+// ==================== GET SINGLE TODO ====================
 
-app.get("/todos/:id", async (req, res) => {
+app.get("/todos/:id", authMiddleware, async (req, res) => {
   try {
-    const todo = await Todo.findById(req.params.id);
+    const todo = await Todo.findOne({
+      _id: req.params.id,
+      userId: req.userId
+    });
 
     if (!todo) {
       return res.status(404).json({
@@ -96,7 +285,6 @@ app.get("/todos/:id", async (req, res) => {
     }
 
     res.status(200).json(todo);
-
   } catch (error) {
     res.status(400).json({
       message: "Invalid Todo ID",
@@ -105,7 +293,9 @@ app.get("/todos/:id", async (req, res) => {
   }
 });
 
-app.put("/todos/:id", async (req, res) => {
+// ==================== UPDATE TODO ====================
+
+app.put("/todos/:id", authMiddleware, async (req, res) => {
   try {
     const { title, completed } = req.body;
 
@@ -131,9 +321,14 @@ app.put("/todos/:id", async (req, res) => {
       updateData.completed = completed;
     }
 
-    const todo = await Todo.findByIdAndUpdate(
-      req.params.id,
-      { $set: updateData },
+    const todo = await Todo.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        userId: req.userId
+      },
+      {
+        $set: updateData
+      },
       {
         new: true,
         runValidators: true
@@ -150,7 +345,6 @@ app.put("/todos/:id", async (req, res) => {
       message: "Todo Updated Successfully",
       todo
     });
-
   } catch (error) {
     res.status(400).json({
       message: "Error Updating Todo",
@@ -159,10 +353,14 @@ app.put("/todos/:id", async (req, res) => {
   }
 });
 
+// ==================== DELETE TODO ====================
 
-app.delete("/todos/:id", async (req, res) => {
+app.delete("/todos/:id", authMiddleware, async (req, res) => {
   try {
-    const todo = await Todo.findByIdAndDelete(req.params.id);
+    const todo = await Todo.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.userId
+    });
 
     if (!todo) {
       return res.status(404).json({
@@ -173,7 +371,6 @@ app.delete("/todos/:id", async (req, res) => {
     res.status(200).json({
       message: "Todo Deleted Successfully"
     });
-
   } catch (error) {
     res.status(400).json({
       message: "Error Deleting Todo",
@@ -182,6 +379,7 @@ app.delete("/todos/:id", async (req, res) => {
   }
 });
 
+// ==================== 404 ROUTE ====================
 
 app.use((req, res) => {
   res.status(404).json({
@@ -189,10 +387,12 @@ app.use((req, res) => {
   });
 });
 
+// ==================== SERVER START ====================
 
 const PORT = process.env.PORT || 5000;
 
-mongoose.connect(process.env.MONGO_URI)
+mongoose
+  .connect(process.env.MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected Successfully");
 
